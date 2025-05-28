@@ -1,0 +1,438 @@
+package miniq.client.integration;
+
+import miniq.client.api.MessageConsumer;
+import miniq.client.api.MessageProducer;
+import miniq.client.impl.SimpleMessageConsumer;
+import miniq.client.impl.SimpleMessageProducer;
+import miniq.config.QConfig;
+import miniq.core.MiniQ;
+import miniq.core.model.Message;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Test class that replicates the functionality in the ScalabilityTestExample class.
+ * This test validates the scalability of MiniQ with different configurations of producers and consumers.
+ */
+public class ScalabilityTest {
+
+    private MiniQ miniQ;
+    private String dbName;
+
+    // Test configurations
+    private static final int[] PRODUCER_COUNTS = {1, 2};
+    private static final int[] CONSUMER_COUNTS = {1, 2};
+    private static final int MESSAGES_PER_PRODUCER = 20;
+    private static final int TEST_DURATION_SECONDS = 5;
+
+    // Flag to track if any database exceptions occurred
+    private volatile boolean databaseExceptionOccurred = false;
+    private volatile String databaseExceptionMessage = null;
+
+    // Counter for testing purposes
+    private static int messageCounter = 0;
+
+    @BeforeEach
+    public void setUp() throws SQLException {
+        // The database will be created in the runTest method
+        // Reset the message counter for each test
+        messageCounter = 0;
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (miniQ != null) {
+            miniQ.close();
+        }
+    }
+
+    /**
+     * Test that runs a scalability test with a specific configuration.
+     * This test is parameterized to run with different combinations of producer and consumer counts.
+     */
+    @ParameterizedTest
+    @CsvSource({
+        "1, 1",
+        "1, 2",
+        "2, 1",
+        "2, 2"
+    })
+    public void testScalability(int producerCount, int consumerCount) throws SQLException, InterruptedException, ExecutionException {
+        // Reset database exception flags
+        databaseExceptionOccurred = false;
+        databaseExceptionMessage = null;
+
+        // Create a unique database name for this test
+        dbName = "test_scalability_" + producerCount + "_" + consumerCount;
+
+        // Run the test
+        TestResult result = runTest(producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
+
+        // Check if any database exceptions occurred
+        if (databaseExceptionOccurred) {
+            fail("Database exception occurred during test: " + databaseExceptionMessage);
+        }
+
+        // Verify the results
+        assertNotNull(result, "Test result should not be null");
+        assertTrue(result.totalMessages > 0, "Should have processed some messages");
+        assertTrue(result.throughput > 0, "Throughput should be positive");
+
+        // Log the results
+        System.out.printf("Scalability test with %d producers and %d consumers:%n", producerCount, consumerCount);
+        System.out.printf("Total messages: %d%n", result.totalMessages);
+        System.out.printf("Throughput: %.2f msgs/sec%n", result.throughput);
+        System.out.printf("Average latency: %.2f ms%n", result.avgLatency);
+    }
+
+    /**
+     * Test that runs a scalability test with all configurations.
+     * This is similar to the main method in ScalabilityTestExample.
+     */
+    @Test
+    public void testAllConfigurations() throws SQLException, InterruptedException {
+        for (int producerCount : PRODUCER_COUNTS) {
+            for (int consumerCount : CONSUMER_COUNTS) {
+                // Skip configurations with too many threads to avoid resource issues
+                if (producerCount + consumerCount > 10) {
+                    continue;
+                }
+
+                try {
+                    // Reset database exception flags
+                    databaseExceptionOccurred = false;
+                    databaseExceptionMessage = null;
+
+                    // Create a unique database name for this test
+                    dbName = "test_scalability_all_" + producerCount + "_" + consumerCount;
+
+                    // Run the test
+                    TestResult result = runTest(producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
+
+                    // Check if any database exceptions occurred
+                    if (databaseExceptionOccurred) {
+                        fail("Database exception occurred during test with " + producerCount + 
+                             " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
+                    }
+
+                    // Verify the results
+                    assertNotNull(result, "Test result should not be null");
+                    assertTrue(result.totalMessages > 0, "Should have processed some messages");
+                    assertTrue(result.throughput > 0, "Throughput should be positive");
+
+                    // Log the results
+                    System.out.printf("Scalability test with %d producers and %d consumers:%n", producerCount, consumerCount);
+                    System.out.printf("Total messages: %d%n", result.totalMessages);
+                    System.out.printf("Throughput: %.2f msgs/sec%n", result.throughput);
+                    System.out.printf("Average latency: %.2f ms%n", result.avgLatency);
+
+                    // Give the system some time to recover between tests
+                    Thread.sleep(1000);
+                } catch (Exception e) {
+                    // Check if this is a database exception that was caught elsewhere
+                    if (databaseExceptionOccurred) {
+                        fail("Database exception occurred during test with " + producerCount + 
+                             " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
+                    } else if (checkForDatabaseException(e, "testAllConfigurations")) {
+                        // If the exception itself is a database exception
+                        fail("Database exception occurred during test with " + producerCount + 
+                             " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
+                    } else {
+                        fail("Error running test with " + producerCount + " producers and " + 
+                             consumerCount + " consumers: " + e.getMessage());
+                    }
+                } finally {
+                    if (miniQ != null) {
+                        miniQ.close();
+                        miniQ = null;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs a scalability test with the specified configuration.
+     * This method is similar to the runTest method in ScalabilityTestExample.
+     */
+    private TestResult runTest(int producerCount, int consumerCount, int messagesPerProducer, int testDurationSeconds) 
+            throws SQLException, InterruptedException, ExecutionException {
+        // Create a MiniQ instance for this test
+        QConfig config = new QConfig.Builder()
+                .DbName(dbName)
+                .QueueName("messages")
+                .QueueMaxSize(producerCount * messagesPerProducer * 2) // Ensure queue is large enough
+                .CreateDb(true)
+                .CreateQueue(true)
+                .build();
+
+        miniQ = new MiniQ(config);
+
+        // Metrics
+        AtomicInteger messagesProduced = new AtomicInteger(0);
+        AtomicInteger messagesConsumed = new AtomicInteger(0);
+        ConcurrentHashMap<String, Long> messageTimestamps = new ConcurrentHashMap<>();
+        List<Long> latencies = new CopyOnWriteArrayList<>();
+
+        // Create thread pools
+        ExecutorService producerExecutor = Executors.newFixedThreadPool(producerCount);
+        ExecutorService consumerExecutor = Executors.newFixedThreadPool(consumerCount);
+
+        try {
+            // Create and start consumers first
+            List<MessageConsumer> consumers = new ArrayList<>();
+            for (int i = 0; i < consumerCount; i++) {
+                final int consumerId = i;
+                MessageConsumer consumer = new SimpleMessageConsumer(miniQ);
+                consumers.add(consumer);
+
+                // Register callback for messages
+                consumer.onMessage(message -> {
+                    try {
+                        processMessage(message, consumerId, messagesConsumed, messageTimestamps, latencies);
+                    } catch (Exception e) {
+                        // Check for database exceptions
+                        if (checkForDatabaseException(e, "consumer callback")) {
+                            throw new RuntimeException("Database exception detected in consumer callback: " + databaseExceptionMessage, e);
+                        }
+                        throw e; // Re-throw other exceptions
+                    }
+                });
+            }
+
+            // Give consumers a chance to start polling
+            Thread.sleep(1000);
+
+            // Create and start producers
+            List<CompletableFuture<Void>> producerFutures = new ArrayList<>();
+            for (int i = 0; i < producerCount; i++) {
+                final int producerId = i;
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    try {
+                        runProducer(miniQ, producerId, messagesPerProducer, messagesProduced, messageTimestamps);
+                    } catch (Exception e) {
+                        // Check for database exceptions
+                        if (checkForDatabaseException(e, "producer thread")) {
+                            throw new RuntimeException("Database exception detected in producer thread: " + databaseExceptionMessage, e);
+                        }
+                        System.err.println("Producer " + producerId + " error: " + e.getMessage());
+                    }
+                }, producerExecutor);
+                producerFutures.add(future);
+            }
+
+            // Start the test timer
+            long startTime = System.currentTimeMillis();
+
+            // Wait for all producers to finish or for the test duration to expire
+            CompletableFuture<Void> allProducers = CompletableFuture.allOf(
+                    producerFutures.toArray(new CompletableFuture[0]));
+
+            try {
+                allProducers.get(testDurationSeconds, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                // Test duration expired, which is expected
+            } catch (ExecutionException e) {
+                // Check for database exceptions
+                if (checkForDatabaseException(e, "waiting for producers")) {
+                    throw new RuntimeException("Database exception detected when waiting for producers: " + databaseExceptionMessage, e);
+                }
+                throw e; // Re-throw other exceptions
+            }
+
+            // Wait a bit more for consumers to process remaining messages
+            Thread.sleep(2000);
+
+            // Calculate test duration
+            long endTime = System.currentTimeMillis();
+            long testDurationMs = endTime - startTime;
+
+            // Calculate metrics
+            int totalMessages = messagesConsumed.get();
+            double throughput = (totalMessages * 1000.0) / testDurationMs; // messages per second
+            double avgLatency = latencies.isEmpty() ? 0 : 
+                    latencies.stream().mapToLong(Long::longValue).average().orElse(0);
+
+            // Close consumers
+            for (MessageConsumer consumer : consumers) {
+                consumer.close();
+            }
+
+            // Shutdown executors
+            producerExecutor.shutdownNow();
+            consumerExecutor.shutdownNow();
+
+            // Final check for database exceptions
+            if (databaseExceptionOccurred) {
+                throw new RuntimeException("Database exception occurred during test: " + databaseExceptionMessage);
+            }
+
+            return new TestResult(totalMessages, throughput, avgLatency);
+        } finally {
+            // Shutdown executors if they haven't been shutdown already
+            if (!producerExecutor.isShutdown()) {
+                producerExecutor.shutdownNow();
+            }
+            if (!consumerExecutor.isShutdown()) {
+                consumerExecutor.shutdownNow();
+            }
+        }
+    }
+
+    /**
+     * Runs a producer that sends messages to the queue.
+     * This method is similar to the runProducer method in ScalabilityTestExample.
+     */
+    private void runProducer(MiniQ miniQ, int producerId, int messageCount, 
+            AtomicInteger messagesProduced, ConcurrentHashMap<String, Long> messageTimestamps) 
+            throws ExecutionException, InterruptedException {
+        MessageProducer producer = new SimpleMessageProducer(miniQ);
+
+        try {
+            for (int i = 0; i < messageCount; i++) {
+                String messageData = "Message " + i + " from Producer " + producerId;
+                String topic = "producer." + producerId;
+
+                // Record timestamp before sending
+                String messageKey = producerId + "-" + i;
+                messageTimestamps.put(messageKey, System.currentTimeMillis());
+
+                try {
+                    // Send message
+                    CompletableFuture<String> future = producer.sendMessage(messageData, topic);
+                    future.get();
+
+                    // Update metrics
+                    messagesProduced.incrementAndGet();
+                } catch (ExecutionException e) {
+                    // Check for database exceptions
+                    if (checkForDatabaseException(e, "runProducer")) {
+                        throw new RuntimeException("Database exception detected in runProducer: " + databaseExceptionMessage, e);
+                    }
+
+                    // If the queue is full, wait a bit and try again
+                    String errorMessage = e.getMessage();
+                    if (e.getCause() != null && e.getCause().getMessage() != null) {
+                        errorMessage = e.getCause().getMessage();
+                    }
+                    if (e.getCause() instanceof RuntimeException && errorMessage != null && errorMessage.contains("Failed to send message")) {
+                        System.err.println("Producer " + producerId + " waiting for queue space...");
+                        Thread.sleep(100); // Wait a bit before retrying
+                        i--; // Retry this message
+                        continue;
+                    }
+                    throw e; // Re-throw other exceptions
+                }
+            }
+        } finally {
+            producer.close();
+        }
+    }
+
+    /**
+     * Processes a message received by a consumer.
+     * This method is similar to the processMessage method in ScalabilityTestExample.
+     */
+    private void processMessage(Message message, int consumerId, 
+            AtomicInteger messagesConsumed, ConcurrentHashMap<String, Long> messageTimestamps,
+            List<Long> latencies) {
+        try {
+            // Increment the message counter
+            messageCounter++;
+
+            // Simulate a database transaction error after processing 5 messages
+            if (messageCounter >= 5) {
+                throw new RuntimeException("Simulated database error: cannot start a transaction within a transaction");
+            }
+
+            // Extract producer ID and message number from the data
+            String data = message.data();
+            String[] parts = data.split(" ");
+            int messageNum = Integer.parseInt(parts[1]);
+            int producerId = Integer.parseInt(parts[4]);
+
+            // Calculate latency
+            String messageKey = producerId + "-" + messageNum;
+            Long sendTime = messageTimestamps.remove(messageKey);
+            if (sendTime != null) {
+                long latency = System.currentTimeMillis() - sendTime;
+                latencies.add(latency);
+            }
+
+            // Update metrics
+            messagesConsumed.incrementAndGet();
+        } catch (Exception e) {
+            // Check for database exceptions
+            if (checkForDatabaseException(e, "processMessage")) {
+                throw new RuntimeException("Database exception detected in processMessage: " + databaseExceptionMessage, e);
+            }
+
+            // Handle other errors gracefully
+            System.err.println("Error processing message: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Class to hold the results of a scalability test.
+     * This class is similar to the TestResult class in ScalabilityTestExample.
+     */
+    private static class TestResult {
+        final int totalMessages;
+        final double throughput;
+        final double avgLatency;
+
+        TestResult(int totalMessages, double throughput, double avgLatency) {
+            this.totalMessages = totalMessages;
+            this.throughput = throughput;
+            this.avgLatency = avgLatency;
+        }
+    }
+
+    /**
+     * Utility method to check if an exception is a database exception.
+     * 
+     * @param e The exception to check
+     * @param context The context where the exception occurred (for logging)
+     * @return true if the exception is a database exception, false otherwise
+     */
+    private boolean checkForDatabaseException(Exception e, String context) {
+        // Check if the cause is an Error (which is what we're now throwing for database transaction errors)
+        if (e.getCause() != null && e.getCause() instanceof Error) {
+            Throwable error = e.getCause();
+            databaseExceptionOccurred = true;
+            databaseExceptionMessage = error.getMessage();
+            System.err.println("DATABASE ERROR in " + context + ": " + databaseExceptionMessage);
+            return true;
+        }
+
+        // Check the exception message
+        String errorMessage = e.getMessage();
+        if (e.getCause() != null && e.getCause().getMessage() != null) {
+            errorMessage = e.getCause().getMessage();
+        }
+
+        if (errorMessage != null && 
+            (errorMessage.contains("SQL error") || 
+             errorMessage.contains("cannot start a transaction within a transaction") ||
+             errorMessage.contains("no transaction is active") ||
+             errorMessage.contains("[DATABASE_TRANSACTION_ERROR]") ||
+             errorMessage.contains("database exception"))) {
+            databaseExceptionOccurred = true;
+            databaseExceptionMessage = errorMessage;
+            System.err.println("DATABASE EXCEPTION in " + context + ": " + errorMessage);
+            return true;
+        }
+        return false;
+    }
+}
