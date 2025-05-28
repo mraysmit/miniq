@@ -401,13 +401,13 @@ public class MiniQ {
         return (qsizeIn(List.of(MessageStatus.READY)) >= this.queueMaxSize);
     }
 
-    // get COUNT of all messages in the queue with status = ?
+    // get COUNT of all messages in the queue with status IN (?)
     public int qsizeIn(List<MessageStatus> messageStatuses) {
-        String sql = String.format("SELECT COUNT(*) as cnt FROM %s WHERE status = ?", this.queueName);
+        String sql = String.format("SELECT COUNT(*) as cnt FROM %s WHERE status IN (%s)", 
+                this.queueName, 
+                miniq.core.utils.QUtils.getMessageStatusString(messageStatuses));
 
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, miniq.core.utils.QUtils.getMessageStatusString(messageStatuses));
-            ResultSet rs = pstmt.executeQuery();
             return executeReturnInt(pstmt);
         } catch (SQLException e) {
             System.err.println("Error in qsizeIn: " + e.getMessage());
