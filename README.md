@@ -1,5 +1,9 @@
 # MiniQ
 
+[![Java](https://img.shields.io/badge/Java-23-orange.svg)](https://openjdk.java.net/projects/jdk/23/)
+[![Maven](https://img.shields.io/badge/Maven-3.8+-blue.svg)](https://maven.apache.org/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 **Version:** 1.0
 **Date:** 2024-04-02
 **Author:** Mark Andrew Ray-Smith Cityline Ltd
