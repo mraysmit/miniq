@@ -54,19 +54,27 @@ public class MiniQ {
      INSERT methods
      ****************************************************************/
     public Message put(String data) throws SQLException {
-        return putMessage(data, null);
+        return putMessage(data, null, Message.DEFAULT_PRIORITY);
     }
 
     public Message put(String data, String route) throws SQLException {
-        return putMessage(data, route);
+        return putMessage(data, route, Message.DEFAULT_PRIORITY);
+    }
+
+    public Message put(String data, int priority) throws SQLException {
+        return putMessage(data, null, priority);
+    }
+
+    public Message put(String data, String route, int priority) throws SQLException {
+        return putMessage(data, route, priority);
     }
 
     // The put method is used to put a message into the queue
-    private Message putMessage(String data, String topic) throws SQLException {
+    private Message putMessage(String data, String topic, int priority) throws SQLException {
         final String messageId = String.valueOf(timeBasedEpochGenerator().generate());
         final int status = MessageStatus.READY.getValue();
         final long inTime = System.currentTimeMillis();
-        String sql = "INSERT INTO %s (message_id, topic, data, status, in_time) VALUES (?, ?, ?, ?, ?)".formatted(this.queueName);
+        String sql = "INSERT INTO %s (message_id, topic, data, status, priority, in_time) VALUES (?, ?, ?, ?, ?, ?)".formatted(this.queueName);
 
         // Check if we need to manage the transaction
         boolean wasAutoCommit = conn.getAutoCommit();
@@ -82,7 +90,8 @@ public class MiniQ {
             pstmt.setString(2, topic);
             pstmt.setString(3, data);
             pstmt.setInt(4, status);
-            pstmt.setLong(5, inTime);
+            pstmt.setInt(5, priority);
+            pstmt.setLong(6, inTime);
             pstmt.executeUpdate();
 
             if (needToCommit) {
@@ -102,7 +111,7 @@ public class MiniQ {
                 conn.setAutoCommit(true);
             }
         }
-        return new Message(messageId, topic, data, MessageStatus.READY, inTime, null, null);
+        return new Message(messageId, topic, data, MessageStatus.READY, priority, inTime, null, null);
     }
 
 
@@ -130,18 +139,18 @@ public class MiniQ {
         }
 
         try {
-            // Step 1: Select the first undone message
+            // Step 1: Select the first undone message (ordered by priority first, then by time)
             PreparedStatement ps1;
             if (routingPattern == null || routingPattern.isEmpty()) {
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? ORDER BY in_time LIMIT 1".formatted(this.queueName));
+                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
                 ps1.setInt(1, MessageStatus.READY.getValue());
             } else if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic = ? ORDER BY in_time LIMIT 1".formatted(this.queueName));
+                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
                 ps1.setInt(1, MessageStatus.READY.getValue());
                 ps1.setString(2, routingPattern);
             } else {
                 String likePattern = routingPattern.replace("*", "%");
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic LIKE ? ORDER BY in_time LIMIT 1".formatted(this.queueName));
+                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic LIKE ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
                 ps1.setInt(1, MessageStatus.READY.getValue());
                 ps1.setString(2, likePattern);
             }
@@ -168,6 +177,7 @@ public class MiniQ {
                         rs1.getString("topic"),
                         rs1.getString("data"),
                         MessageStatus.LOCKED,
+                        rs1.getInt("priority"),
                         rs1.getLong("in_time"),
                         System.currentTimeMillis(),
                         resultSetGetLong(rs1, "done_time")
@@ -229,6 +239,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.LOCKED,
+                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             System.currentTimeMillis(),
                             rs.getLong("done_time")
@@ -279,6 +290,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
+                            rs.getInt("priority"),
                             resultSetGetLong(rs,"in_time"),
                             resultSetGetLong(rs,"lock_time"),
                             resultSetGetLong(rs,"done_time")
@@ -308,6 +320,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
+                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             resultSetGetLong(rs, "lock_time"),
                             resultSetGetLong(rs, "done_time")
@@ -401,6 +414,7 @@ public class MiniQ {
                         rs.getString("topic"),
                         rs.getString("data"),
                         MessageStatus.values()[rs.getInt("status")],
+                        rs.getInt("priority"),
                         rs.getLong("in_time"),
                         resultSetGetLong(rs, "lock_time"),
                         resultSetGetLong(rs, "done_time")
@@ -749,6 +763,7 @@ public class MiniQ {
                 " topic TEXT, " +
                 " data TEXT NOT NULL, " +
                 " status INTEGER NOT NULL, " +
+                " priority INTEGER NOT NULL DEFAULT 5, " +
                 " in_time INTEGER NOT NULL, " +
                 " lock_time INTEGER, " +
                 " done_time INTEGER)";
@@ -757,6 +772,17 @@ public class MiniQ {
             conn.commit();
         } catch (SQLException e) {
             logger.error("Error creating table in Qinit: {}", e.getMessage(), e);
+        }
+
+        // Add priority column to existing tables (for backward compatibility)
+        try {
+            final var stmt2b = conn.createStatement();
+            final var sql2b = "ALTER TABLE " + this.queueName + " ADD COLUMN priority INTEGER NOT NULL DEFAULT 5";
+            stmt2b.executeUpdate(sql2b);
+            conn.commit();
+        } catch (SQLException e) {
+            // Column might already exist, which is fine
+            logger.debug("Priority column might already exist: {}", e.getMessage());
         }
 
         // Create the indexes
@@ -776,6 +802,16 @@ public class MiniQ {
             conn.commit();
         } catch (SQLException e) {
             logger.error("Error creating status index in Qinit: {}", e.getMessage(), e);
+        }
+
+        // Create priority index for efficient priority-based queries
+        final var stmtPriority = conn.createStatement();
+        final var sqlPriority = "CREATE INDEX IF NOT EXISTS idx_queue_priority ON " + this.queueName + "(priority, in_time)";
+        try {
+            stmtPriority.executeUpdate(sqlPriority);
+            conn.commit();
+        } catch (SQLException e) {
+            logger.error("Error creating priority index in Qinit: {}", e.getMessage(), e);
         }
 
         // Create the trigger to set messages as failed

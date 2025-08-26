@@ -16,13 +16,32 @@ public interface MessageProducer {
     
     /**
      * Sends a message to the queue with a specific topic.
-     * 
+     *
      * @param data The message data
      * @param topic The message topic
      * @return A CompletableFuture that completes with the message ID when the message is sent
      */
     CompletableFuture<String> sendMessage(String data, String topic);
-    
+
+    /**
+     * Sends a message to the queue with a specific priority.
+     *
+     * @param data The message data
+     * @param priority The message priority (1 = highest, 10 = lowest)
+     * @return A CompletableFuture that completes with the message ID when the message is sent
+     */
+    CompletableFuture<String> sendMessage(String data, int priority);
+
+    /**
+     * Sends a message to the queue with a specific topic and priority.
+     *
+     * @param data The message data
+     * @param topic The message topic
+     * @param priority The message priority (1 = highest, 10 = lowest)
+     * @return A CompletableFuture that completes with the message ID when the message is sent
+     */
+    CompletableFuture<String> sendMessage(String data, String topic, int priority);
+
     /**
      * Closes the producer and releases any resources.
      */

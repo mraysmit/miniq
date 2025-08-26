@@ -49,7 +49,31 @@ public class SimpleMessageProducer implements MessageProducer {
             }
         }, executor);
     }
-    
+
+    @Override
+    public CompletableFuture<String> sendMessage(String data, int priority) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Message message = miniQ.put(data, priority);
+                return message.messageId();
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to send message", e);
+            }
+        }, executor);
+    }
+
+    @Override
+    public CompletableFuture<String> sendMessage(String data, String topic, int priority) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Message message = miniQ.put(data, topic, priority);
+                return message.messageId();
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to send message", e);
+            }
+        }, executor);
+    }
+
     @Override
     public void close() {
         // No need to close the MiniQ instance here, as it might be shared
