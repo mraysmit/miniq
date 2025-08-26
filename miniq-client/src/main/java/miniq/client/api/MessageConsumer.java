@@ -56,6 +56,16 @@ public interface MessageConsumer {
     void onMessage(String topicPattern, Consumer<Message> callback);
 
     /**
+     * Registers a callback to be invoked when a message with a specific routing key pattern is received.
+     * The routing key pattern is composed of segments, where each segment can be a specific value,
+     * a single-segment wildcard (*), or a multi-segment wildcard (#).
+     * 
+     * @param routingKeyPattern The segments of the routing key pattern
+     * @param callback The callback to invoke
+     */
+    void onMessage(String[] routingKeyPattern, Consumer<Message> callback);
+
+    /**
      * Closes the consumer and releases any resources.
      */
     void close();

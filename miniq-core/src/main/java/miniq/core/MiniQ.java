@@ -3,7 +3,9 @@ package miniq.core;
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.fasterxml.uuid.Generators;
 
@@ -28,6 +30,9 @@ TODO: add proper error handling
 public class MiniQ {
     private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(MiniQ.class);
 
+    // Cache for frequently used routing patterns
+    private final Map<String, String> patternQueryCache = new ConcurrentHashMap<>();
+
     private final Connection conn;
     private final String dbName;
     private final String queueName;
@@ -44,7 +49,19 @@ public class MiniQ {
         this.sqliteCacheSizeBytes = config.sqliteCacheSizeBytes();
         this.isCreateDb = config.createDb();
         this.isCreateQueue = config.createQueue();
-        this.conn = DriverManager.getConnection("jdbc:sqlite:" + (this.dbName != null ? this.dbName : ":memory:"));
+
+        // If dbName is not null and not ":memory:", prepend the "db\" folder path
+        String dbPath = this.dbName;
+        if (dbPath != null && !dbPath.equals(":memory:")) {
+            // Create the db directory if it doesn't exist
+            java.io.File dbDir = new java.io.File("db");
+            if (!dbDir.exists()) {
+                dbDir.mkdirs();
+            }
+            dbPath = "db\\" + dbPath;
+        }
+
+        this.conn = DriverManager.getConnection("jdbc:sqlite:" + (dbPath != null ? dbPath : ":memory:"));
 
         Qinit();
     }
@@ -54,27 +71,18 @@ public class MiniQ {
      INSERT methods
      ****************************************************************/
     public Message put(String data) throws SQLException {
-        return putMessage(data, null, Message.DEFAULT_PRIORITY);
+        return putMessage(data, null);
     }
 
     public Message put(String data, String route) throws SQLException {
-        return putMessage(data, route, Message.DEFAULT_PRIORITY);
-    }
-
-    public Message put(String data, int priority) throws SQLException {
-        return putMessage(data, null, priority);
-    }
-
-    public Message put(String data, String route, int priority) throws SQLException {
-        return putMessage(data, route, priority);
+        return putMessage(data, route);
     }
 
     // The put method is used to put a message into the queue
-    private Message putMessage(String data, String topic, int priority) throws SQLException {
+    private Message putMessage(String data, String routingKey) throws SQLException {
         final String messageId = String.valueOf(timeBasedEpochGenerator().generate());
         final int status = MessageStatus.READY.getValue();
         final long inTime = System.currentTimeMillis();
-        String sql = "INSERT INTO %s (message_id, topic, data, status, priority, in_time) VALUES (?, ?, ?, ?, ?, ?)".formatted(this.queueName);
 
         // Check if we need to manage the transaction
         boolean wasAutoCommit = conn.getAutoCommit();
@@ -85,14 +93,25 @@ public class MiniQ {
             conn.setAutoCommit(false);
         }
 
-        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, messageId);
-            pstmt.setString(2, topic);
-            pstmt.setString(3, data);
-            pstmt.setInt(4, status);
-            pstmt.setInt(5, priority);
-            pstmt.setLong(6, inTime);
-            pstmt.executeUpdate();
+        try {
+            // Insert into main queue table
+            String sql = "INSERT INTO %s (message_id, topic, data, status, in_time) VALUES (?, ?, ?, ?, ?)".formatted(this.queueName);
+            try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                pstmt.setString(1, messageId);
+                pstmt.setString(2, routingKey);
+                pstmt.setString(3, data);
+                pstmt.setInt(4, status);
+                pstmt.setLong(5, inTime);
+                pstmt.executeUpdate();
+            }
+
+            // Parse and store routing segments if routing key is provided
+            if (routingKey != null && !routingKey.isEmpty()) {
+                String[] segments = routingKey.split("\\.");
+                for (int i = 0; i < segments.length; i++) {
+                    storeRoutingSegment(messageId, i, segments[i]);
+                }
+            }
 
             if (needToCommit) {
                 // Only commit if we started the transaction
@@ -111,7 +130,18 @@ public class MiniQ {
                 conn.setAutoCommit(true);
             }
         }
-        return new Message(messageId, topic, data, MessageStatus.READY, priority, inTime, null, null);
+        return new Message(messageId, routingKey, data, MessageStatus.READY, inTime, null, null);
+    }
+
+    // Helper method to store a routing segment
+    private void storeRoutingSegment(String messageId, int position, String value) throws SQLException {
+        String sql = "INSERT INTO routing_segments (message_id, segment_position, segment_value) VALUES (?, ?, ?)";
+        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, messageId);
+            pstmt.setInt(2, position);
+            pstmt.setString(3, value);
+            pstmt.executeUpdate();
+        }
     }
 
 
@@ -127,8 +157,17 @@ public class MiniQ {
     }
 
     // The popWithRoutingPattern method is used to pop a message from the queue with a specific routing pattern
-    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*".
-    public Message popWithRoutingPattern(String routingPattern) throws SQLException {
+    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*" or "#".
+    public Message popWithRoutingPattern(String pattern) throws SQLException {
+        if (pattern == null || pattern.isEmpty()) {
+            return pop(); // Default behavior
+        }
+
+        if (!pattern.contains("*") && !pattern.contains("#")) {
+            // Exact match
+            return popWithExactRoutingKey(pattern);
+        }
+
         // Check if we need to manage the transaction
         boolean wasAutoCommit = conn.getAutoCommit();
         boolean needToCommit = wasAutoCommit;
@@ -139,27 +178,31 @@ public class MiniQ {
         }
 
         try {
-            // Step 1: Select the first undone message (ordered by priority first, then by time)
-            PreparedStatement ps1;
-            if (routingPattern == null || routingPattern.isEmpty()) {
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
-                ps1.setInt(1, MessageStatus.READY.getValue());
-            } else if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
-                ps1.setInt(1, MessageStatus.READY.getValue());
-                ps1.setString(2, routingPattern);
-            } else {
-                String likePattern = routingPattern.replace("*", "%");
-                ps1 = conn.prepareStatement("SELECT * FROM %s WHERE status = ? AND topic LIKE ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName));
-                ps1.setInt(1, MessageStatus.READY.getValue());
-                ps1.setString(2, likePattern);
+            // Parse pattern into segments
+            String[] patternSegments = pattern.split("\\.");
+
+            // Build SQL query based on pattern segments
+            StringBuilder sql = new StringBuilder();
+            sql.append("SELECT m.* FROM ").append(this.queueName).append(" m WHERE m.status = ? ");
+
+            // Add pattern matching conditions
+            if (patternSegments.length > 0) {
+                sql.append("AND m.message_id IN (");
+                sql.append(buildPatternMatchingQuery(patternSegments));
+                sql.append(") ");
             }
+
+            sql.append("ORDER BY m.in_time LIMIT 1");
+
+            // Execute query
+            PreparedStatement ps1 = conn.prepareStatement(sql.toString());
+            ps1.setInt(1, MessageStatus.READY.getValue());
 
             ResultSet rs1 = ps1.executeQuery();
 
             if (rs1.next()) {
-                // Step 2: Lock the message to avoid another process from getting it too
-                PreparedStatement ps2 = conn.prepareStatement("UPDATE %s SET status = ?, lock_time = ? WHERE message_id = ? AND status = ?".formatted(this.queueName));
+                // Lock the message
+                PreparedStatement ps2 = conn.prepareStatement("UPDATE " + this.queueName + " SET status = ?, lock_time = ? WHERE message_id = ? AND status = ?");
                 ps2.setInt(1, MessageStatus.LOCKED.getValue());
                 ps2.setLong(2, System.currentTimeMillis());
                 ps2.setString(3, rs1.getString("message_id"));
@@ -171,17 +214,21 @@ public class MiniQ {
                     conn.commit();
                 }
 
-                // Step 3: Return the selected message
+                // Return the selected message
                 return new Message(
                         rs1.getString("message_id"),
                         rs1.getString("topic"),
                         rs1.getString("data"),
                         MessageStatus.LOCKED,
-                        rs1.getInt("priority"),
                         rs1.getLong("in_time"),
                         System.currentTimeMillis(),
                         resultSetGetLong(rs1, "done_time")
                 );
+            }
+
+            if (needToCommit) {
+                // Only commit if we started the transaction
+                conn.commit();
             }
 
         } catch (SQLException e) {
@@ -196,6 +243,162 @@ public class MiniQ {
                 conn.setAutoCommit(true);
             }
         }
+
+        return null;
+    }
+
+    // Helper method to build pattern matching query
+    private String buildPatternMatchingQuery(String[] patternSegments) {
+        String patternKey = String.join(".", patternSegments);
+
+        // Check cache first
+        if (patternQueryCache.containsKey(patternKey)) {
+            return patternQueryCache.get(patternKey);
+        }
+
+        StringBuilder subquery = new StringBuilder();
+        subquery.append("SELECT DISTINCT rs1.message_id FROM routing_segments rs1 ");
+
+        // Track if we have a multi-segment wildcard
+        boolean hasMultiSegmentWildcard = false;
+        int lastSegmentIndex = -1;
+
+        for (int i = 0; i < patternSegments.length; i++) {
+            String segment = patternSegments[i];
+
+            if (segment.equals("#")) {
+                // Multi-segment wildcard
+                hasMultiSegmentWildcard = true;
+                lastSegmentIndex = i;
+                break;
+            } else if (i > 0) {
+                // Join with previous segments
+                subquery.append("INNER JOIN routing_segments rs").append(i + 1).append(" ON rs1.message_id = rs").append(i + 1).append(".message_id ");
+            }
+        }
+
+        subquery.append("WHERE ");
+
+        // Add conditions for each segment
+        for (int i = 0; i < patternSegments.length; i++) {
+            if (hasMultiSegmentWildcard && i >= lastSegmentIndex) {
+                break;
+            }
+
+            String segment = patternSegments[i];
+
+            if (i > 0) {
+                subquery.append("AND ");
+            }
+
+            subquery.append("rs").append(i + 1).append(".segment_position = ").append(i).append(" ");
+
+            if (segment.equals("*")) {
+                // Single-segment wildcard - no additional condition needed
+            } else if (!segment.equals("#")) {
+                // Exact match
+                subquery.append("AND rs").append(i + 1).append(".segment_value = '").append(segment).append("' ");
+            }
+        }
+
+        // Handle multi-segment wildcard if present
+        if (hasMultiSegmentWildcard && lastSegmentIndex < patternSegments.length - 1) {
+            // There are segments after the # wildcard
+            for (int i = lastSegmentIndex + 1; i < patternSegments.length; i++) {
+                String segment = patternSegments[i];
+
+                if (segment.equals("*") || segment.equals("#")) {
+                    continue; // Skip wildcards after #
+                }
+
+                // Add condition to match this segment at any position > lastSegmentIndex
+                subquery.append("AND EXISTS (SELECT 1 FROM routing_segments rs_tail WHERE rs1.message_id = rs_tail.message_id ");
+                subquery.append("AND rs_tail.segment_value = '").append(segment).append("' ");
+
+                // If this is the last segment in the pattern, it must be the last segment in the routing key
+                if (i == patternSegments.length - 1) {
+                    subquery.append("AND NOT EXISTS (SELECT 1 FROM routing_segments rs_next WHERE rs1.message_id = rs_next.message_id ");
+                    subquery.append("AND rs_next.segment_position > rs_tail.segment_position) ");
+                }
+
+                subquery.append(") ");
+            }
+        } else if (!hasMultiSegmentWildcard) {
+            // If no # wildcard, ensure the routing key has exactly the same number of segments
+            subquery.append("AND NOT EXISTS (SELECT 1 FROM routing_segments rs_extra WHERE rs1.message_id = rs_extra.message_id ");
+            subquery.append("AND rs_extra.segment_position >= ").append(patternSegments.length).append(") ");
+        }
+
+        String result = subquery.toString();
+
+        // Cache the result
+        patternQueryCache.put(patternKey, result);
+
+        return result;
+    }
+
+    // Helper method for exact routing key match
+    private Message popWithExactRoutingKey(String routingKey) throws SQLException {
+        // Check if we need to manage the transaction
+        boolean wasAutoCommit = conn.getAutoCommit();
+        boolean needToCommit = wasAutoCommit;
+
+        if (wasAutoCommit) {
+            // Begin transaction only if autoCommit was true
+            conn.setAutoCommit(false);
+        }
+
+        try {
+            // Select the first message with the exact routing key
+            PreparedStatement ps1 = conn.prepareStatement("SELECT * FROM " + this.queueName + " WHERE status = ? AND topic = ? ORDER BY in_time LIMIT 1");
+            ps1.setInt(1, MessageStatus.READY.getValue());
+            ps1.setString(2, routingKey);
+
+            ResultSet rs1 = ps1.executeQuery();
+
+            if (rs1.next()) {
+                // Lock the message
+                PreparedStatement ps2 = conn.prepareStatement("UPDATE " + this.queueName + " SET status = ?, lock_time = ? WHERE message_id = ? AND status = ?");
+                ps2.setInt(1, MessageStatus.LOCKED.getValue());
+                ps2.setLong(2, System.currentTimeMillis());
+                ps2.setString(3, rs1.getString("message_id"));
+                ps2.setInt(4, MessageStatus.READY.getValue());
+                ps2.executeUpdate();
+
+                if (needToCommit) {
+                    // Only commit if we started the transaction
+                    conn.commit();
+                }
+
+                // Return the selected message
+                return new Message(
+                        rs1.getString("message_id"),
+                        rs1.getString("topic"),
+                        rs1.getString("data"),
+                        MessageStatus.LOCKED,
+                        rs1.getLong("in_time"),
+                        System.currentTimeMillis(),
+                        resultSetGetLong(rs1, "done_time")
+                );
+            }
+
+            if (needToCommit) {
+                // Only commit if we started the transaction
+                conn.commit();
+            }
+        } catch (SQLException e) {
+            if (needToCommit) {
+                // Only rollback if we started the transaction
+                conn.rollback();
+            }
+            throw e;
+        } finally {
+            if (wasAutoCommit) {
+                // Only reset autoCommit if it was true before
+                conn.setAutoCommit(true);
+            }
+        }
+
         return null;
     }
 
@@ -239,7 +442,6 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.LOCKED,
-                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             System.currentTimeMillis(),
                             rs.getLong("done_time")
@@ -290,7 +492,6 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
-                            rs.getInt("priority"),
                             resultSetGetLong(rs,"in_time"),
                             resultSetGetLong(rs,"lock_time"),
                             resultSetGetLong(rs,"done_time")
@@ -320,7 +521,6 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
-                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             resultSetGetLong(rs, "lock_time"),
                             resultSetGetLong(rs, "done_time")
@@ -414,7 +614,6 @@ public class MiniQ {
                         rs.getString("topic"),
                         rs.getString("data"),
                         MessageStatus.values()[rs.getInt("status")],
-                        rs.getInt("priority"),
                         rs.getLong("in_time"),
                         resultSetGetLong(rs, "lock_time"),
                         resultSetGetLong(rs, "done_time")
@@ -763,7 +962,6 @@ public class MiniQ {
                 " topic TEXT, " +
                 " data TEXT NOT NULL, " +
                 " status INTEGER NOT NULL, " +
-                " priority INTEGER NOT NULL DEFAULT 5, " +
                 " in_time INTEGER NOT NULL, " +
                 " lock_time INTEGER, " +
                 " done_time INTEGER)";
@@ -772,17 +970,6 @@ public class MiniQ {
             conn.commit();
         } catch (SQLException e) {
             logger.error("Error creating table in Qinit: {}", e.getMessage(), e);
-        }
-
-        // Add priority column to existing tables (for backward compatibility)
-        try {
-            final var stmt2b = conn.createStatement();
-            final var sql2b = "ALTER TABLE " + this.queueName + " ADD COLUMN priority INTEGER NOT NULL DEFAULT 5";
-            stmt2b.executeUpdate(sql2b);
-            conn.commit();
-        } catch (SQLException e) {
-            // Column might already exist, which is fine
-            logger.debug("Priority column might already exist: {}", e.getMessage());
         }
 
         // Create the indexes
@@ -804,14 +991,38 @@ public class MiniQ {
             logger.error("Error creating status index in Qinit: {}", e.getMessage(), e);
         }
 
-        // Create priority index for efficient priority-based queries
-        final var stmtPriority = conn.createStatement();
-        final var sqlPriority = "CREATE INDEX IF NOT EXISTS idx_queue_priority ON " + this.queueName + "(priority, in_time)";
+        // Create the routing_segments table
+        final var stmtSegments = conn.createStatement();
+        final var sqlSegments = "CREATE TABLE IF NOT EXISTS routing_segments " +
+                "(message_id TEXT NOT NULL, " +
+                " segment_position INTEGER NOT NULL, " +
+                " segment_value TEXT NOT NULL, " +
+                " PRIMARY KEY (message_id, segment_position), " +
+                " FOREIGN KEY (message_id) REFERENCES " + this.queueName + "(message_id) ON DELETE CASCADE)";
         try {
-            stmtPriority.executeUpdate(sqlPriority);
+            stmtSegments.executeUpdate(sqlSegments);
             conn.commit();
         } catch (SQLException e) {
-            logger.error("Error creating priority index in Qinit: {}", e.getMessage(), e);
+            logger.error("Error creating routing_segments table in Qinit: {}", e.getMessage(), e);
+        }
+
+        // Create indexes for efficient lookups
+        final var stmtSegmentIndex1 = conn.createStatement();
+        final var sqlSegmentIndex1 = "CREATE INDEX IF NOT EXISTS idx_routing_segments_value ON routing_segments(segment_value)";
+        try {
+            stmtSegmentIndex1.executeUpdate(sqlSegmentIndex1);
+            conn.commit();
+        } catch (SQLException e) {
+            logger.error("Error creating segment_value index in Qinit: {}", e.getMessage(), e);
+        }
+
+        final var stmtSegmentIndex2 = conn.createStatement();
+        final var sqlSegmentIndex2 = "CREATE INDEX IF NOT EXISTS idx_routing_segments_position ON routing_segments(segment_position)";
+        try {
+            stmtSegmentIndex2.executeUpdate(sqlSegmentIndex2);
+            conn.commit();
+        } catch (SQLException e) {
+            logger.error("Error creating segment_position index in Qinit: {}", e.getMessage(), e);
         }
 
         // Create the trigger to set messages as failed

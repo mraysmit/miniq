@@ -12,6 +12,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -26,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * This test validates the scalability of MiniQ with different configurations of producers and consumers.
  */
 public class ScalabilityTest {
+    private static final Logger logger = LoggerFactory.getLogger(ScalabilityTest.class);
 
     private MiniQ miniQ;
     private String dbName;
@@ -45,14 +48,18 @@ public class ScalabilityTest {
 
     @BeforeEach
     public void setUp() throws SQLException {
+        logger.debug("Setting up test");
         // The database will be created in the runTest method
         // Reset the message counter for each test
         messageCounter = 0;
+        logger.debug("Message counter reset");
     }
 
     @AfterEach
     public void tearDown() {
+        logger.debug("Tearing down test");
         if (miniQ != null) {
+            logger.debug("Closing MiniQ instance");
             miniQ.close();
         }
     }
@@ -69,18 +76,24 @@ public class ScalabilityTest {
         "2, 2"
     })
     public void testScalability(int producerCount, int consumerCount) throws SQLException, InterruptedException, ExecutionException {
+        logger.info("Starting scalability test with {} producers and {} consumers", producerCount, consumerCount);
+
         // Reset database exception flags
         databaseExceptionOccurred = false;
         databaseExceptionMessage = null;
 
         // Create a unique database name for this test
         dbName = "test_scalability_" + producerCount + "_" + consumerCount;
+        logger.debug("Using database: {}", dbName);
 
         // Run the test
+        logger.debug("Running test with {} producers, {} consumers, {} messages per producer, {} seconds duration", 
+            producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
         TestResult result = runTest(producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
 
         // Check if any database exceptions occurred
         if (databaseExceptionOccurred) {
+            logger.error("Database exception occurred during test: {}", databaseExceptionMessage);
             fail("Database exception occurred during test: " + databaseExceptionMessage);
         }
 
@@ -90,6 +103,12 @@ public class ScalabilityTest {
         assertTrue(result.throughput > 0, "Throughput should be positive");
 
         // Log the results
+        logger.info("Scalability test with {} producers and {} consumers:", producerCount, consumerCount);
+        logger.info("Total messages: {}", result.totalMessages);
+        logger.info("Throughput: {} msgs/sec", String.format("%.2f", result.throughput));
+        logger.info("Average latency: {} ms", String.format("%.2f", result.avgLatency));
+
+        // Keep System.out for test output visibility
         System.out.printf("Scalability test with %d producers and %d consumers:%n", producerCount, consumerCount);
         System.out.printf("Total messages: %d%n", result.totalMessages);
         System.out.printf("Throughput: %.2f msgs/sec%n", result.throughput);
@@ -102,26 +121,41 @@ public class ScalabilityTest {
      */
     @Test
     public void testAllConfigurations() throws SQLException, InterruptedException {
+        logger.info("Starting test of all configurations");
+
         for (int producerCount : PRODUCER_COUNTS) {
             for (int consumerCount : CONSUMER_COUNTS) {
                 // Skip configurations with too many threads to avoid resource issues
                 if (producerCount + consumerCount > 10) {
+                    logger.debug("Skipping configuration with {} producers and {} consumers (too many threads)", 
+                        producerCount, consumerCount);
                     continue;
                 }
+
+                logger.info("Testing configuration with {} producers and {} consumers", producerCount, consumerCount);
 
                 try {
                     // Reset database exception flags
                     databaseExceptionOccurred = false;
                     databaseExceptionMessage = null;
 
+                    // Reset message counter for each test configuration
+                    messageCounter = 0;
+                    logger.debug("Reset message counter for new test configuration");
+
                     // Create a unique database name for this test
                     dbName = "test_scalability_all_" + producerCount + "_" + consumerCount;
+                    logger.debug("Using database: {}", dbName);
 
                     // Run the test
+                    logger.debug("Running test with {} producers, {} consumers, {} messages per producer, {} seconds duration", 
+                        producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
                     TestResult result = runTest(producerCount, consumerCount, MESSAGES_PER_PRODUCER, TEST_DURATION_SECONDS);
 
                     // Check if any database exceptions occurred
                     if (databaseExceptionOccurred) {
+                        logger.error("Database exception occurred during test with {} producers and {} consumers: {}", 
+                            producerCount, consumerCount, databaseExceptionMessage);
                         fail("Database exception occurred during test with " + producerCount + 
                              " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
                     }
@@ -132,34 +166,50 @@ public class ScalabilityTest {
                     assertTrue(result.throughput > 0, "Throughput should be positive");
 
                     // Log the results
+                    logger.info("Scalability test with {} producers and {} consumers:", producerCount, consumerCount);
+                    logger.info("Total messages: {}", result.totalMessages);
+                    logger.info("Throughput: {} msgs/sec", String.format("%.2f", result.throughput));
+                    logger.info("Average latency: {} ms", String.format("%.2f", result.avgLatency));
+
+                    // Keep System.out for test output visibility
                     System.out.printf("Scalability test with %d producers and %d consumers:%n", producerCount, consumerCount);
                     System.out.printf("Total messages: %d%n", result.totalMessages);
                     System.out.printf("Throughput: %.2f msgs/sec%n", result.throughput);
                     System.out.printf("Average latency: %.2f ms%n", result.avgLatency);
 
                     // Give the system some time to recover between tests
+                    logger.debug("Waiting 1 second before next test configuration");
                     Thread.sleep(1000);
                 } catch (Exception e) {
                     // Check if this is a database exception that was caught elsewhere
                     if (databaseExceptionOccurred) {
+                        logger.error("Database exception occurred during test with {} producers and {} consumers: {}", 
+                            producerCount, consumerCount, databaseExceptionMessage);
                         fail("Database exception occurred during test with " + producerCount + 
                              " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
                     } else if (checkForDatabaseException(e, "testAllConfigurations")) {
                         // If the exception itself is a database exception
+                        logger.error("Database exception occurred during test with {} producers and {} consumers: {}", 
+                            producerCount, consumerCount, databaseExceptionMessage);
                         fail("Database exception occurred during test with " + producerCount + 
                              " producers and " + consumerCount + " consumers: " + databaseExceptionMessage);
                     } else {
+                        logger.error("Error running test with {} producers and {} consumers: {}", 
+                            producerCount, consumerCount, e.getMessage(), e);
                         fail("Error running test with " + producerCount + " producers and " + 
                              consumerCount + " consumers: " + e.getMessage());
                     }
                 } finally {
                     if (miniQ != null) {
+                        logger.debug("Closing MiniQ instance");
                         miniQ.close();
                         miniQ = null;
                     }
                 }
             }
         }
+
+        logger.info("Completed test of all configurations");
     }
 
     /**
@@ -348,14 +398,6 @@ public class ScalabilityTest {
             AtomicInteger messagesConsumed, ConcurrentHashMap<String, Long> messageTimestamps,
             List<Long> latencies) {
         try {
-            // Increment the message counter
-            messageCounter++;
-
-            // Simulate a database transaction error after processing 5 messages
-            if (messageCounter >= 5) {
-                throw new RuntimeException("Simulated database error: cannot start a transaction within a transaction");
-            }
-
             // Extract producer ID and message number from the data
             String data = message.data();
             String[] parts = data.split(" ");
@@ -407,12 +449,18 @@ public class ScalabilityTest {
      * @return true if the exception is a database exception, false otherwise
      */
     private boolean checkForDatabaseException(Exception e, String context) {
+        logger.debug("Checking if exception in context '{}' is a database exception", context);
+
         // Check if the cause is an Error (which is what we're now throwing for database transaction errors)
         if (e.getCause() != null && e.getCause() instanceof Error) {
             Throwable error = e.getCause();
             databaseExceptionOccurred = true;
             databaseExceptionMessage = error.getMessage();
-            System.err.println("DATABASE ERROR in " + context + ": " + databaseExceptionMessage);
+
+            String errorMsg = "DATABASE ERROR in " + context + ": " + databaseExceptionMessage;
+            logger.error(errorMsg, error);
+            System.err.println(errorMsg); // Keep for test compatibility
+
             return true;
         }
 
@@ -430,9 +478,15 @@ public class ScalabilityTest {
              errorMessage.contains("database exception"))) {
             databaseExceptionOccurred = true;
             databaseExceptionMessage = errorMessage;
-            System.err.println("DATABASE EXCEPTION in " + context + ": " + errorMessage);
+
+            String exceptionMsg = "DATABASE EXCEPTION in " + context + ": " + errorMessage;
+            logger.error(exceptionMsg, e);
+            System.err.println(exceptionMsg); // Keep for test compatibility
+
             return true;
         }
+
+        logger.debug("Exception in context '{}' is not a database exception", context);
         return false;
     }
 }

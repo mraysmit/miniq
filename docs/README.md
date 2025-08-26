@@ -1,5 +1,9 @@
 # MiniQ
 
+**Version:** 1.0
+**Date:** 2024-04-02
+**Author:** Mark Andrew Ray-Smith Cityline Ltd
+
 MiniQ is a lightweight, embedded message queue system built on SQLite. It provides a simple, reliable way to implement message queuing in Java applications without the need for external message brokers.
 
 ## Features
