@@ -99,7 +99,7 @@ public class SimpleMessageProducerTest {
         // Verify the message data and priority
         assertNotNull(message);
         assertEquals(testData, message.data());
-        assertEquals(testPriority, message.priority());
+        assertEquals(testPriority, (int) message.priority());
         assertNull(message.topic());
     }
 
@@ -122,7 +122,7 @@ public class SimpleMessageProducerTest {
         assertNotNull(message);
         assertEquals(testData, message.data());
         assertEquals(testTopic, message.topic());
-        assertEquals(testPriority, message.priority());
+        assertEquals(testPriority, (int) message.priority());
     }
 
     @Test
@@ -138,13 +138,13 @@ public class SimpleMessageProducerTest {
         Message thirdMessage = miniQ.pop();
 
         // Verify priority ordering (1 = highest, 5 = default, 10 = lowest)
-        assertEquals(Message.HIGH_PRIORITY, firstMessage.priority());
+        assertEquals(Message.HIGH_PRIORITY, (int) firstMessage.priority());
         assertEquals("High priority", firstMessage.data());
 
-        assertEquals(Message.DEFAULT_PRIORITY, secondMessage.priority());
+        assertEquals(Message.DEFAULT_PRIORITY, (int) secondMessage.priority());
         assertEquals("Default priority", secondMessage.data());
 
-        assertEquals(Message.LOW_PRIORITY, thirdMessage.priority());
+        assertEquals(Message.LOW_PRIORITY, (int) thirdMessage.priority());
         assertEquals("Low priority", thirdMessage.data());
     }
 }

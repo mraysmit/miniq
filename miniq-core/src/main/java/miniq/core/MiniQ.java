@@ -71,15 +71,23 @@ public class MiniQ {
      INSERT methods
      ****************************************************************/
     public Message put(String data) throws SQLException {
-        return putMessage(data, null);
+        return putMessage(data, null, Message.DEFAULT_PRIORITY);
     }
 
     public Message put(String data, String route) throws SQLException {
-        return putMessage(data, route);
+        return putMessage(data, route, Message.DEFAULT_PRIORITY);
+    }
+
+    public Message put(String data, int priority) throws SQLException {
+        return putMessage(data, null, priority);
+    }
+
+    public Message put(String data, String route, int priority) throws SQLException {
+        return putMessage(data, route, priority);
     }
 
     // The put method is used to put a message into the queue
-    private Message putMessage(String data, String routingKey) throws SQLException {
+    private Message putMessage(String data, String routingKey, int priority) throws SQLException {
         final String messageId = String.valueOf(timeBasedEpochGenerator().generate());
         final int status = MessageStatus.READY.getValue();
         final long inTime = System.currentTimeMillis();
@@ -95,13 +103,14 @@ public class MiniQ {
 
         try {
             // Insert into main queue table
-            String sql = "INSERT INTO %s (message_id, topic, data, status, in_time) VALUES (?, ?, ?, ?, ?)".formatted(this.queueName);
+            String sql = "INSERT INTO %s (message_id, topic, data, status, priority, in_time) VALUES (?, ?, ?, ?, ?, ?)".formatted(this.queueName);
             try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setString(1, messageId);
                 pstmt.setString(2, routingKey);
                 pstmt.setString(3, data);
                 pstmt.setInt(4, status);
-                pstmt.setLong(5, inTime);
+                pstmt.setInt(5, priority);
+                pstmt.setLong(6, inTime);
                 pstmt.executeUpdate();
             }
 
@@ -130,7 +139,7 @@ public class MiniQ {
                 conn.setAutoCommit(true);
             }
         }
-        return new Message(messageId, routingKey, data, MessageStatus.READY, inTime, null, null);
+        return new Message(messageId, routingKey, data, MessageStatus.READY, priority, inTime, null, null);
     }
 
     // Helper method to store a routing segment
@@ -153,14 +162,47 @@ public class MiniQ {
     // select the first message in the queue with status = READY
     // lock the message to avoid another process from getting it
     public Message pop() throws SQLException {
-        return popWithRoutingPattern(null);
+        return popDirect();
+    }
+
+    // Direct pop without routing pattern logic to avoid recursion
+    private Message popDirect() throws SQLException {
+        String sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? ORDER BY priority ASC, in_time ASC LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
+
+        try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setInt(1, MessageStatus.LOCKED.getValue());
+            pstmt.setLong(2, System.currentTimeMillis());
+            pstmt.setInt(3, MessageStatus.READY.getValue());
+
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return new Message(
+                            rs.getString("message_id"),
+                            rs.getString("topic"),
+                            rs.getString("data"),
+                            MessageStatus.LOCKED,
+                            rs.getInt("priority"),
+                            rs.getLong("in_time"),
+                            System.currentTimeMillis(),
+                            rs.getLong("done_time")
+                    );
+                }
+                else {
+                    return null;
+                }
+            } catch (SQLException e) {
+                System.err.println("Error in popDirect: " + e.getMessage());
+                return null;
+            }
+        }
     }
 
     // The popWithRoutingPattern method is used to pop a message from the queue with a specific routing pattern
     // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*" or "#".
     public Message popWithRoutingPattern(String pattern) throws SQLException {
         if (pattern == null || pattern.isEmpty()) {
-            return pop(); // Default behavior
+            // Use the direct pop logic without routing pattern
+            return popDirect();
         }
 
         if (!pattern.contains("*") && !pattern.contains("#")) {
@@ -192,7 +234,7 @@ public class MiniQ {
                 sql.append(") ");
             }
 
-            sql.append("ORDER BY m.in_time LIMIT 1");
+            sql.append("ORDER BY m.priority ASC, m.in_time ASC LIMIT 1");
 
             // Execute query
             PreparedStatement ps1 = conn.prepareStatement(sql.toString());
@@ -220,6 +262,7 @@ public class MiniQ {
                         rs1.getString("topic"),
                         rs1.getString("data"),
                         MessageStatus.LOCKED,
+                        rs1.getInt("priority"),
                         rs1.getLong("in_time"),
                         System.currentTimeMillis(),
                         resultSetGetLong(rs1, "done_time")
@@ -247,7 +290,7 @@ public class MiniQ {
         return null;
     }
 
-    // Helper method to build pattern matching query
+    // Helper method to build pattern matching query for message IDs
     private String buildPatternMatchingQuery(String[] patternSegments) {
         String patternKey = String.join(".", patternSegments);
 
@@ -327,6 +370,10 @@ public class MiniQ {
             // If no # wildcard, ensure the routing key has exactly the same number of segments
             subquery.append("AND NOT EXISTS (SELECT 1 FROM routing_segments rs_extra WHERE rs1.message_id = rs_extra.message_id ");
             subquery.append("AND rs_extra.segment_position >= ").append(patternSegments.length).append(") ");
+
+            // Also ensure all required positions exist (for patterns with * wildcards)
+            subquery.append("AND EXISTS (SELECT 1 FROM routing_segments rs_check WHERE rs1.message_id = rs_check.message_id ");
+            subquery.append("AND rs_check.segment_position = ").append(patternSegments.length - 1).append(") ");
         }
 
         String result = subquery.toString();
@@ -335,6 +382,42 @@ public class MiniQ {
         patternQueryCache.put(patternKey, result);
 
         return result;
+    }
+
+    // Helper method to build enhanced routing pattern WHERE clause for SELECT queries
+    private String buildEnhancedRoutingWhereClause(String routingPattern, MessageStatus status) {
+        if (routingPattern == null || routingPattern.isEmpty()) {
+            if (status != null) {
+                return "WHERE status = " + status.getValue();
+            } else {
+                return "";
+            }
+        }
+
+        if (!routingPattern.contains("*") && !routingPattern.contains("#")) {
+            // Exact match
+            if (status != null) {
+                return "WHERE topic = '" + routingPattern + "' AND status = " + status.getValue();
+            } else {
+                return "WHERE topic = '" + routingPattern + "'";
+            }
+        }
+
+        // Enhanced pattern matching using routing segments
+        String[] patternSegments = routingPattern.split("\\.");
+        String messageIdSubquery = buildPatternMatchingQuery(patternSegments);
+
+        if (status != null) {
+            return "WHERE message_id IN (" + messageIdSubquery + ") AND status = " + status.getValue();
+        } else {
+            return "WHERE message_id IN (" + messageIdSubquery + ")";
+        }
+    }
+
+    // Helper method to determine if enhanced routing should be used
+    private boolean shouldUseEnhancedRouting(String routingPattern) {
+        return routingPattern != null && !routingPattern.isEmpty() &&
+               (routingPattern.contains("*") || routingPattern.contains("#"));
     }
 
     // Helper method for exact routing key match
@@ -350,7 +433,7 @@ public class MiniQ {
 
         try {
             // Select the first message with the exact routing key
-            PreparedStatement ps1 = conn.prepareStatement("SELECT * FROM " + this.queueName + " WHERE status = ? AND topic = ? ORDER BY in_time LIMIT 1");
+            PreparedStatement ps1 = conn.prepareStatement("SELECT * FROM " + this.queueName + " WHERE status = ? AND topic = ? ORDER BY priority ASC, in_time ASC LIMIT 1");
             ps1.setInt(1, MessageStatus.READY.getValue());
             ps1.setString(2, routingKey);
 
@@ -376,6 +459,7 @@ public class MiniQ {
                         rs1.getString("topic"),
                         rs1.getString("data"),
                         MessageStatus.LOCKED,
+                        rs1.getInt("priority"),
                         rs1.getLong("in_time"),
                         System.currentTimeMillis(),
                         resultSetGetLong(rs1, "done_time")
@@ -408,17 +492,20 @@ public class MiniQ {
     }
 
     // The popReturningWithRoutingPattern method is used to pop a message from the queue with a specific routing pattern
-    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*".
+    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*" or "#".
     public Message popReturningWithRoutingPattern(String routingPattern) throws SQLException {
         String sql;
 
         if (routingPattern == null || routingPattern.isEmpty()) {
-            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? ORDER BY in_time LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
-        } else if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
-            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? AND topic = ? ORDER BY in_time LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
+            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? ORDER BY priority ASC, in_time ASC LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
+        } else if (!routingPattern.contains("*") && !routingPattern.contains("#")) {
+            // Exact match
+            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? AND topic = ? ORDER BY priority ASC, in_time ASC LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
         } else {
-            String likePattern = routingPattern.replace("*", "%");
-            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? AND topic LIKE ? ORDER BY in_time LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName);
+            // Enhanced pattern matching using routing segments
+            String[] patternSegments = routingPattern.split("\\.");
+            String messageIdSubquery = buildPatternMatchingQuery(patternSegments);
+            sql = "UPDATE %s SET status = ?, lock_time = ? WHERE rowid = (SELECT rowid FROM %s WHERE status = ? AND message_id IN (%s) ORDER BY priority ASC, in_time ASC LIMIT 1) RETURNING *".formatted(this.queueName, this.queueName, messageIdSubquery);
         }
 
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -426,13 +513,9 @@ public class MiniQ {
             pstmt.setLong(2, System.currentTimeMillis());
             pstmt.setInt(3, MessageStatus.READY.getValue());
 
-            if (routingPattern != null && !routingPattern.isEmpty()) {
-                if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
-                    pstmt.setString(4, routingPattern);
-                } else {
-                    String likePattern = routingPattern.replace("*", "%");
-                    pstmt.setString(4, likePattern);
-                }
+            if (routingPattern != null && !routingPattern.isEmpty() && !routingPattern.contains("*") && !routingPattern.contains("#")) {
+                // Only set the topic parameter for exact matches
+                pstmt.setString(4, routingPattern);
             }
 
             try (ResultSet rs = pstmt.executeQuery()) {
@@ -442,6 +525,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.LOCKED,
+                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             System.currentTimeMillis(),
                             rs.getLong("done_time")
@@ -463,25 +547,25 @@ public class MiniQ {
     }
 
     // The peekWithRoutingPattern method is used to peek at the first message in the queue with a specific routing pattern
-    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*".
+    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*" or "#".
     public Message peekWithRoutingPattern(String routingPattern) throws SQLException {
         PreparedStatement pstmt;
 
         if (routingPattern == null || routingPattern.isEmpty()) {
-            final var sql = "SELECT * FROM %s WHERE status = ? ORDER BY in_time LIMIT 1".formatted(this.queueName);
+            final var sql = "SELECT * FROM %s WHERE status = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName);
             pstmt = conn.prepareStatement(sql);
             pstmt.setInt(1, MessageStatus.READY.getValue());
-        } else if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
-            final var sql = "SELECT * FROM %s WHERE status = ? AND topic = ? ORDER BY in_time LIMIT 1".formatted(this.queueName);
+        } else if (!routingPattern.contains("*") && !routingPattern.contains("#")) {
+            // Exact match
+            final var sql = "SELECT * FROM %s WHERE status = ? AND topic = ? ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName);
             pstmt = conn.prepareStatement(sql);
             pstmt.setInt(1, MessageStatus.READY.getValue());
             pstmt.setString(2, routingPattern);
         } else {
-            String likePattern = routingPattern.replace("*", "%");
-            final var sql = "SELECT * FROM %s WHERE status = ? AND topic LIKE ? ORDER BY in_time LIMIT 1".formatted(this.queueName);
+            // Enhanced pattern matching using routing segments
+            String whereClause = buildEnhancedRoutingWhereClause(routingPattern, MessageStatus.READY);
+            final var sql = "SELECT * FROM %s %s ORDER BY priority ASC, in_time ASC LIMIT 1".formatted(this.queueName, whereClause);
             pstmt = conn.prepareStatement(sql);
-            pstmt.setInt(1, MessageStatus.READY.getValue());
-            pstmt.setString(2, likePattern);
         }
 
         try (pstmt) {
@@ -492,6 +576,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
+                            rs.getInt("priority"),
                             resultSetGetLong(rs,"in_time"),
                             resultSetGetLong(rs,"lock_time"),
                             resultSetGetLong(rs,"done_time")
@@ -521,6 +606,7 @@ public class MiniQ {
                             rs.getString("topic"),
                             rs.getString("data"),
                             MessageStatus.values()[rs.getInt("status")],
+                            rs.getInt("priority"),
                             rs.getLong("in_time"),
                             resultSetGetLong(rs, "lock_time"),
                             resultSetGetLong(rs, "done_time")
@@ -533,12 +619,13 @@ public class MiniQ {
     }
 
     // The getByRoutingPattern method is used to get messages by routing pattern.
-    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*".
+    // The routing pattern is in the format "xx.xx" where each part can be a specific value or a wildcard "*" or "#".
     // For example, "orders.created" would match only messages with that exact topic,
-    // while "orders.*" would match any message with a topic that starts with "orders.".
+    // while "orders.*" would match any message with a topic that starts with "orders.",
+    // and "orders.#" would match any message with a topic that starts with "orders." and has any number of additional segments.
     public List<Message> getByRoutingPattern(String routingPattern, MessageStatus status) throws SQLException {
-        // If the routing pattern doesn't contain a dot or wildcard, use exact match
-        if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
+        if (!routingPattern.contains("*") && !routingPattern.contains("#")) {
+            // Exact match
             String sql = "SELECT * FROM %s WHERE topic = ? AND status = ?".formatted(this.queueName);
             try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setString(1, routingPattern);
@@ -547,21 +634,23 @@ public class MiniQ {
             }
         }
 
-        // Convert the routing pattern to a SQL LIKE pattern
-        String likePattern = routingPattern.replace("*", "%");
-        String sql = "SELECT * FROM %s WHERE topic LIKE ? AND status = ?".formatted(this.queueName);
+        // Enhanced pattern matching using routing segments
+        String whereClause = buildEnhancedRoutingWhereClause(routingPattern, status);
+        String sql = "SELECT * FROM %s %s ORDER BY priority ASC, in_time ASC".formatted(this.queueName, whereClause);
 
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, likePattern);
-            pstmt.setInt(2, status.getValue());
             return getMessages(pstmt);
         }
     }
 
     // Get all messages with a specific routing pattern regardless of status
     public List<Message> getAllByRoutingPattern(String routingPattern) throws SQLException {
-        // If the routing pattern doesn't contain a dot or wildcard, use exact match
-        if (!routingPattern.contains(".") && !routingPattern.contains("*")) {
+        if (routingPattern == null || routingPattern.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        if (!routingPattern.contains("*") && !routingPattern.contains("#")) {
+            // Exact match
             String sql = "SELECT * FROM %s WHERE topic = ?".formatted(this.queueName);
             try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
                 pstmt.setString(1, routingPattern);
@@ -569,12 +658,11 @@ public class MiniQ {
             }
         }
 
-        // Convert the routing pattern to a SQL LIKE pattern
-        String likePattern = routingPattern.replace("*", "%");
-        String sql = "SELECT * FROM %s WHERE topic LIKE ?".formatted(this.queueName);
+        // Enhanced pattern matching using routing segments
+        String whereClause = buildEnhancedRoutingWhereClause(routingPattern, null);
+        String sql = "SELECT * FROM %s %s ORDER BY priority ASC, in_time ASC".formatted(this.queueName, whereClause);
 
         try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, likePattern);
             return getMessages(pstmt);
         }
     }
@@ -614,6 +702,7 @@ public class MiniQ {
                         rs.getString("topic"),
                         rs.getString("data"),
                         MessageStatus.values()[rs.getInt("status")],
+                        rs.getInt("priority"),
                         rs.getLong("in_time"),
                         resultSetGetLong(rs, "lock_time"),
                         resultSetGetLong(rs, "done_time")
@@ -962,6 +1051,7 @@ public class MiniQ {
                 " topic TEXT, " +
                 " data TEXT NOT NULL, " +
                 " status INTEGER NOT NULL, " +
+                " priority INTEGER DEFAULT 5, " +
                 " in_time INTEGER NOT NULL, " +
                 " lock_time INTEGER, " +
                 " done_time INTEGER)";

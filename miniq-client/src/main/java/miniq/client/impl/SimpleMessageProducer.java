@@ -62,10 +62,33 @@ public class SimpleMessageProducer implements MessageProducer {
     }
 
     @Override
-    public CompletableFuture<String> sendMessage(String data, String[] routingKeySegments) {
-        String routingKey = String.join(".", routingKeySegments);
-        logger.debug("Sending message with data: {} and routing key segments: {}", data, routingKey);
-        return sendMessage(data, routingKey);
+    public CompletableFuture<String> sendMessage(String data, int priority) {
+        logger.debug("Sending message with data: {} and priority: {}", data, priority);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Message message = miniQ.put(data, priority);
+                logger.debug("Message sent successfully with ID: {} and priority: {}", message.messageId(), priority);
+                return message.messageId();
+            } catch (SQLException e) {
+                logger.error("Failed to send message with priority: {}", priority, e);
+                throw new RuntimeException("Failed to send message", e);
+            }
+        }, executor);
+    }
+
+    @Override
+    public CompletableFuture<String> sendMessage(String data, String topic, int priority) {
+        logger.debug("Sending message with data: {}, topic: {}, and priority: {}", data, topic, priority);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Message message = miniQ.put(data, topic, priority);
+                logger.debug("Message sent successfully with ID: {}, topic: {}, and priority: {}", message.messageId(), topic, priority);
+                return message.messageId();
+            } catch (SQLException e) {
+                logger.error("Failed to send message with topic: {} and priority: {}", topic, priority, e);
+                throw new RuntimeException("Failed to send message", e);
+            }
+        }, executor);
     }
 
     @Override
