@@ -1027,6 +1027,7 @@ public class MiniQ {
         final var stmt = conn.createStatement();
         stmt.execute(String.format("PRAGMA cache_size = %d;", this.sqliteCacheSizeBytes));
         stmt.execute("PRAGMA journal_mode = WAL;");
+        stmt.execute("PRAGMA busy_timeout = 5000;"); // Wait up to 5 seconds for locks
         stmt.execute("PRAGMA temp_store = MEMORY;");
         stmt.execute("PRAGMA synchronous = NORMAL;");
 

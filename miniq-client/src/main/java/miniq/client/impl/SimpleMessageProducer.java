@@ -1,6 +1,7 @@
 package miniq.client.impl;
 
 import miniq.client.api.MessageProducer;
+import miniq.config.QConfig;
 import miniq.core.MiniQ;
 import miniq.core.model.Message;
 
@@ -19,16 +20,35 @@ public class SimpleMessageProducer implements MessageProducer {
 
     private final MiniQ miniQ;
     private final Executor executor;
+    private final boolean ownsMiniQ; // true if this producer created its own MiniQ instance
 
     /**
      * Creates a new SimpleMessageProducer with the specified MiniQ instance.
+     * The MiniQ instance is shared and will NOT be closed when this producer is closed.
      * 
      * @param miniQ The MiniQ instance to use
      */
     public SimpleMessageProducer(MiniQ miniQ) {
         this.miniQ = miniQ;
         this.executor = Executors.newSingleThreadExecutor();
-        logger.debug("Created SimpleMessageProducer with MiniQ instance: {}", miniQ);
+        this.ownsMiniQ = false;
+        logger.debug("Created SimpleMessageProducer with shared MiniQ instance: {}", miniQ);
+    }
+
+    /**
+     * Creates a new SimpleMessageProducer with its own MiniQ connection.
+     * This constructor creates a dedicated database connection for this producer,
+     * enabling true concurrent access without lock contention.
+     * The MiniQ instance will be closed when this producer is closed.
+     * 
+     * @param config The QConfig to use for creating the MiniQ instance
+     * @throws SQLException If there is an error creating the MiniQ instance
+     */
+    public SimpleMessageProducer(QConfig config) throws SQLException {
+        this.miniQ = new MiniQ(config);
+        this.executor = Executors.newSingleThreadExecutor();
+        this.ownsMiniQ = true;
+        logger.debug("Created SimpleMessageProducer with dedicated MiniQ instance: {}", miniQ);
     }
 
     @Override
@@ -94,8 +114,10 @@ public class SimpleMessageProducer implements MessageProducer {
     @Override
     public void close() {
         logger.info("Closing SimpleMessageProducer");
-        // No need to close the MiniQ instance here, as it might be shared
-        // The caller should close the MiniQ instance when done
+        if (ownsMiniQ && miniQ != null) {
+            logger.debug("Closing owned MiniQ instance");
+            miniQ.close();
+        }
         logger.debug("SimpleMessageProducer closed");
     }
 }

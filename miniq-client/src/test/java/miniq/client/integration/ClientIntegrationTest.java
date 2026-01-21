@@ -28,13 +28,14 @@ import static org.junit.jupiter.api.Assertions.*;
 public class ClientIntegrationTest {
     
     private MiniQ miniQ;
+    private QConfig sharedConfig;
     private MessageProducer producer;
     private MessageConsumer consumer;
     
     @BeforeEach
     public void setUp() throws SQLException {
-        // Create a MiniQ instance with an in-memory database for testing
-        QConfig config = new QConfig.Builder()
+        // Create a QConfig for shared and dedicated connections
+        sharedConfig = new QConfig.Builder()
                 .DbName("test_integration")
                 .QueueName("test_queue")
                 .QueueMaxSize(100)
@@ -42,7 +43,8 @@ public class ClientIntegrationTest {
                 .CreateQueue(true)
                 .build();
         
-        miniQ = new MiniQ(config);
+        // Create a shared MiniQ instance for basic tests
+        miniQ = new MiniQ(sharedConfig);
         producer = new SimpleMessageProducer(miniQ);
         consumer = new SimpleMessageConsumer(miniQ);
     }
@@ -101,33 +103,55 @@ public class ClientIntegrationTest {
     }
     
     @Test
-    public void testCallbackIntegration() throws InterruptedException, ExecutionException {
-        // Create a latch to wait for callbacks
-        CountDownLatch latch = new CountDownLatch(2);
-        AtomicInteger orderCallbackCount = new AtomicInteger(0);
-        AtomicInteger userCallbackCount = new AtomicInteger(0);
+    public void testCallbackIntegration() throws InterruptedException, ExecutionException, SQLException {
+        // Close the shared producer/consumer - we'll use dedicated connections for this test
+        consumer.close();
+        producer.close();
         
-        // Register callbacks for different topic patterns
-        consumer.onMessage("orders.*", message -> {
-            orderCallbackCount.incrementAndGet();
-            latch.countDown();
-        });
+        // Create a config for this test (don't recreate DB since it already exists)
+        QConfig dedicatedConfig = new QConfig.Builder()
+                .DbName("test_integration")
+                .QueueName("test_queue")
+                .QueueMaxSize(100)
+                .CreateDb(false)  // DB already exists
+                .CreateQueue(false) // Queue already exists
+                .build();
         
-        consumer.onMessage("users.*", message -> {
-            userCallbackCount.incrementAndGet();
-            latch.countDown();
-        });
+        // Create producer and consumer with their own dedicated connections
+        MessageProducer dedicatedProducer = new SimpleMessageProducer(dedicatedConfig);
+        MessageConsumer dedicatedConsumer = new SimpleMessageConsumer(dedicatedConfig);
         
-        // Send messages with different topics
-        producer.sendMessage("Order message", "orders.created").get();
-        producer.sendMessage("User message", "users.created").get();
-        
-        // Wait for both callbacks to be invoked
-        boolean callbacksInvoked = latch.await(5, TimeUnit.SECONDS);
-        
-        // Verify the callbacks were invoked
-        assertTrue(callbacksInvoked);
-        assertEquals(1, orderCallbackCount.get());
-        assertEquals(1, userCallbackCount.get());
+        try {
+            // Create a latch to wait for callbacks
+            CountDownLatch latch = new CountDownLatch(2);
+            AtomicInteger orderCallbackCount = new AtomicInteger(0);
+            AtomicInteger userCallbackCount = new AtomicInteger(0);
+            
+            // Register callbacks for different topic patterns
+            dedicatedConsumer.onMessage("orders.*", message -> {
+                orderCallbackCount.incrementAndGet();
+                latch.countDown();
+            });
+            
+            dedicatedConsumer.onMessage("users.*", message -> {
+                userCallbackCount.incrementAndGet();
+                latch.countDown();
+            });
+            
+            // Send messages with different topics
+            dedicatedProducer.sendMessage("Order message", "orders.created").get();
+            dedicatedProducer.sendMessage("User message", "users.created").get();
+            
+            // Wait for both callbacks to be invoked
+            boolean callbacksInvoked = latch.await(5, TimeUnit.SECONDS);
+            
+            // Verify the callbacks were invoked
+            assertTrue(callbacksInvoked);
+            assertEquals(1, orderCallbackCount.get());
+            assertEquals(1, userCallbackCount.get());
+        } finally {
+            dedicatedConsumer.close();
+            dedicatedProducer.close();
+        }
     }
 }

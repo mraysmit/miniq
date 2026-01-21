@@ -127,27 +127,47 @@ public class SimpleMessageConsumerTest {
 
     @Test
     public void testOnMessage() throws SQLException, InterruptedException {
-        // Create a latch to wait for the callback
-        CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<Message> receivedMessage = new AtomicReference<>();
+        // Use dedicated connections for producer and consumer to avoid SQLite concurrency issues
+        QConfig config = new QConfig.Builder()
+                .DbName("test_consumer")
+                .QueueName("test_queue")
+                .QueueMaxSize(100)
+                .CreateDb(true)
+                .CreateQueue(true)
+                .build();
+        
+        // Create dedicated producer with its own connection
+        SimpleMessageProducer dedicatedProducer = new SimpleMessageProducer(config);
+        // Create dedicated consumer with its own connection
+        SimpleMessageConsumer dedicatedConsumer = new SimpleMessageConsumer(config);
 
-        // Register a callback
-        consumer.onMessage(message -> {
-            receivedMessage.set(message);
-            latch.countDown();
-        });
+        try {
+            // Create a latch to wait for the callback
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<Message> receivedMessage = new AtomicReference<>();
 
-        // Put a message in the queue
-        String testData = "Test message for callback";
-        Message putMessage = miniQ.put(testData);
+            // Register a callback
+            dedicatedConsumer.onMessage(message -> {
+                receivedMessage.set(message);
+                latch.countDown();
+            });
 
-        // Wait for the callback to be invoked
-        boolean callbackInvoked = latch.await(5, TimeUnit.SECONDS);
+            // Put a message in the queue using dedicated producer
+            String testData = "Test message for callback";
+            CompletableFuture<String> future = dedicatedProducer.sendMessage(testData);
+            String messageId = future.join();
 
-        // Verify the callback was invoked
-        assertTrue(callbackInvoked);
-        assertNotNull(receivedMessage.get());
-        assertEquals(testData, receivedMessage.get().data());
+            // Wait for the callback to be invoked
+            boolean callbackInvoked = latch.await(5, TimeUnit.SECONDS);
+
+            // Verify the callback was invoked
+            assertTrue(callbackInvoked);
+            assertNotNull(receivedMessage.get());
+            assertEquals(testData, receivedMessage.get().data());
+        } finally {
+            dedicatedConsumer.close();
+            dedicatedProducer.close();
+        }
     }
 
     @Test

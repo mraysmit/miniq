@@ -1,6 +1,7 @@
 package miniq.client.impl;
 
 import miniq.client.api.MessageConsumer;
+import miniq.config.QConfig;
 import miniq.core.MiniQ;
 import miniq.core.model.Message;
 import miniq.core.model.MessageStatus;
@@ -35,31 +36,74 @@ public class SimpleMessageConsumer implements MessageConsumer {
     private final ScheduledExecutorService scheduler;
     private final Map<String, Consumer<Message>> topicCallbacks;
     private final Consumer<Message> defaultCallback;
+    private final boolean ownsMiniQ; // true if this consumer created its own MiniQ instance
     private boolean isRunning;
 
     /**
      * Creates a new SimpleMessageConsumer with the specified MiniQ instance.
+     * The MiniQ instance is shared and will NOT be closed when this consumer is closed.
      * 
      * @param miniQ The MiniQ instance to use
      */
     public SimpleMessageConsumer(MiniQ miniQ) {
-        this(miniQ, null);
+        this(miniQ, null, false);
     }
 
     /**
      * Creates a new SimpleMessageConsumer with the specified MiniQ instance and default callback.
+     * The MiniQ instance is shared and will NOT be closed when this consumer is closed.
      * 
      * @param miniQ The MiniQ instance to use
      * @param defaultCallback The default callback to invoke when a message is received
      */
     public SimpleMessageConsumer(MiniQ miniQ, Consumer<Message> defaultCallback) {
+        this(miniQ, defaultCallback, false);
+    }
+
+    /**
+     * Creates a new SimpleMessageConsumer with its own MiniQ connection.
+     * This constructor creates a dedicated database connection for this consumer,
+     * enabling true concurrent access without lock contention.
+     * The MiniQ instance will be closed when this consumer is closed.
+     * 
+     * @param config The QConfig to use for creating the MiniQ instance
+     * @throws SQLException If there is an error creating the MiniQ instance
+     */
+    public SimpleMessageConsumer(QConfig config) throws SQLException {
+        this(new MiniQ(config), null, true);
+    }
+
+    /**
+     * Creates a new SimpleMessageConsumer with its own MiniQ connection and default callback.
+     * This constructor creates a dedicated database connection for this consumer,
+     * enabling true concurrent access without lock contention.
+     * The MiniQ instance will be closed when this consumer is closed.
+     * 
+     * @param config The QConfig to use for creating the MiniQ instance
+     * @param defaultCallback The default callback to invoke when a message is received
+     * @throws SQLException If there is an error creating the MiniQ instance
+     */
+    public SimpleMessageConsumer(QConfig config, Consumer<Message> defaultCallback) throws SQLException {
+        this(new MiniQ(config), defaultCallback, true);
+    }
+
+    /**
+     * Internal constructor that handles MiniQ ownership.
+     * 
+     * @param miniQ The MiniQ instance to use
+     * @param defaultCallback The default callback to invoke when a message is received
+     * @param ownsMiniQ Whether this consumer owns (and should close) the MiniQ instance
+     */
+    private SimpleMessageConsumer(MiniQ miniQ, Consumer<Message> defaultCallback, boolean ownsMiniQ) {
         this.miniQ = miniQ;
         this.executor = Executors.newSingleThreadExecutor();
         this.scheduler = Executors.newSingleThreadScheduledExecutor();
         this.topicCallbacks = new ConcurrentHashMap<>();
         this.defaultCallback = defaultCallback;
+        this.ownsMiniQ = ownsMiniQ;
         this.isRunning = false;
-        logger.debug("Created SimpleMessageConsumer with MiniQ instance: {}", miniQ);
+        logger.debug("Created SimpleMessageConsumer with {} MiniQ instance: {}", 
+            ownsMiniQ ? "dedicated" : "shared", miniQ);
         if (defaultCallback != null) {
             logger.debug("Default callback registered");
         }
@@ -299,8 +343,10 @@ public class SimpleMessageConsumer implements MessageConsumer {
             logger.warn("Interrupted while waiting for scheduler to terminate", e);
             Thread.currentThread().interrupt();
         }
+        if (ownsMiniQ && miniQ != null) {
+            logger.debug("Closing owned MiniQ instance");
+            miniQ.close();
+        }
         logger.info("SimpleMessageConsumer closed");
-        // No need to close the MiniQ instance here, as it might be shared
-        // The caller should close the MiniQ instance when done
     }
 }
